@@ -7,6 +7,7 @@ from .models import (
 )
 
 
+# basic user serializer - used in most other serializers as nested data
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -14,18 +15,23 @@ class UserSerializer(serializers.ModelSerializer):
                   'gst_number', 'is_active', 'created_at']
 
 
+# subscription plan - just exposing all fields for now
 class SubscriptionPlanSerializer(serializers.ModelSerializer):
     class Meta:
         model = SubscriptionPlan
         fields = '__all__'
 
 
+# gateway transaction serializer
 class PaymentGatewayTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = PaymentGatewayTransaction
         fields = '__all__'
 
 
+# payment serializer
+# user is read only so we get full user details back
+# user_id is write only so we can pass just the id when creating
 class PaymentSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
     user_id = serializers.PrimaryKeyRelatedField(
@@ -39,6 +45,8 @@ class PaymentSerializer(serializers.ModelSerializer):
                   'is_international', 'created_at', 'updated_at']
 
 
+# card payment has extra fields like card number last 4 digits, brand etc
+# made them all optional since not always needed
 class CardPaymentSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
     user_id = serializers.PrimaryKeyRelatedField(
@@ -62,6 +70,7 @@ class CardPaymentSerializer(serializers.ModelSerializer):
         }
 
 
+# cash payment - receipt number and location not mandatory
 class CashPaymentSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
     user_id = serializers.PrimaryKeyRelatedField(
@@ -81,6 +90,7 @@ class CashPaymentSerializer(serializers.ModelSerializer):
         }
 
 
+# user subscription - includes nested user and plan details
 class UserSubscriptionSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
     user_id = serializers.PrimaryKeyRelatedField(
@@ -99,12 +109,16 @@ class UserSubscriptionSerializer(serializers.ModelSerializer):
                   'renewal_reminder_sent', 'created_at']
 
 
+# gst validation - expose everything
 class GSTValidationSerializer(serializers.ModelSerializer):
     class Meta:
         model = GSTValidation
         fields = '__all__'
 
 
+# invoice serializer
+# tax and total are calculated automatically so marked as read only
+# invoice number and qr code are also auto generated
 class InvoiceSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
     user_id = serializers.PrimaryKeyRelatedField(
@@ -119,6 +133,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
                             'created_at', 'updated_at']
 
     def create(self, validated_data):
+        # auto calculate tax and total before saving
         subtotal = validated_data.get('subtotal', 0)
         tax_rate = validated_data.get('tax_rate', 18)
         tax_amount = (subtotal * tax_rate) / 100
@@ -127,6 +142,9 @@ class InvoiceSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
+# eway bill serializer
+# bill number is auto generated so read only
+# has custom validation for minimum taxable value per country
 class EwayBillSerializer(serializers.ModelSerializer):
     user = UserSerializer(read_only=True)
     user_id = serializers.PrimaryKeyRelatedField(
@@ -139,6 +157,7 @@ class EwayBillSerializer(serializers.ModelSerializer):
         read_only_fields = ['eway_bill_number', 'created_at']
 
     def validate(self, data):
+        # eway bill only needed above certain value - differs by country
         country = data.get('country', 'India')
         taxable_value = data.get('taxable_value', 0)
 

@@ -23,18 +23,23 @@ from .serializers import (
 )
 
 
+# base class - all views inherit from this
+# has two helper methods we reuse everywhere
 class BaseView(APIView):
     def get_object(self, model, pk):
+        # returns None if not found instead of crashing
         try:
             return model.objects.get(pk=pk)
         except model.DoesNotExist:
             return None
 
     def superadmin_only(self, request):
+        # checks the custom header we set for admin routes
         token = request.headers.get('X-Superadmin-Token', '')
         return token == 'nixel-superadmin-2024'
 
 
+# user endpoints
 class UserListView(BaseView):
     def get(self, request):
         users = User.objects.all()
@@ -48,6 +53,8 @@ class UserListView(BaseView):
         return Response({'success': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# superadmin - list and create plans
+# requires X-Superadmin-Token header on every request
 class SuperadminPlanListView(BaseView):
     def get(self, request):
         if not self.superadmin_only(request):
@@ -65,6 +72,7 @@ class SuperadminPlanListView(BaseView):
         return Response({'success': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# superadmin - get, update, publish/hide, delete a single plan
 class SuperadminPlanDetailView(BaseView):
     def get(self, request, pk):
         if not self.superadmin_only(request):
@@ -87,6 +95,7 @@ class SuperadminPlanDetailView(BaseView):
         return Response({'success': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
     def patch(self, request, pk):
+        # this handles publish, hide and draft actions
         if not self.superadmin_only(request):
             return Response({'success': False, 'message': 'Superadmin access only'}, status=status.HTTP_403_FORBIDDEN)
         plan = self.get_object(SubscriptionPlan, pk)
@@ -117,6 +126,8 @@ class SuperadminPlanDetailView(BaseView):
         return Response({'success': True, 'message': 'Plan deleted'})
 
 
+# public plans page - no auth needed
+# pass ?country=India or ?country=Australia to get correct pricing
 class PublicPlanListView(BaseView):
     def get(self, request):
         country = request.query_params.get('country', 'India')
@@ -124,12 +135,15 @@ class PublicPlanListView(BaseView):
         data = []
         for plan in plans:
             plan_data = SubscriptionPlanSerializer(plan).data
+            # attach the correct price for this country
             plan_data['price'] = str(plan.get_price_for_country(country))
             plan_data['currency'] = 'INR' if country == 'India' else 'AUD' if country == 'Australia' else 'USD'
             data.append(plan_data)
         return Response({'success': True, 'country': country, 'data': data})
 
 
+# step 1 of checkout - customer registers
+# account is inactive until payment is done
 class RegistrationView(BaseView):
     def post(self, request):
         name = request.data.get('name')
@@ -145,6 +159,7 @@ class RegistrationView(BaseView):
         return Response({'success': True, 'message': 'Registration successful. Proceed to checkout.', 'user_id': user.id, 'data': UserSerializer(user).data}, status=status.HTTP_201_CREATED)
 
 
+# step 2 - customer selects a plan and we create a gateway transaction record
 class CheckoutView(BaseView):
     def post(self, request):
         user_id = request.data.get('user_id')
@@ -172,6 +187,8 @@ class CheckoutView(BaseView):
         }})
 
 
+# step 3 - create a payment intent with the gateway
+# in production this would call razorpay api and return their order id
 class PaymentInitiateView(BaseView):
     def post(self, request):
         gateway_txn_id = request.data.get('gateway_transaction_id')
@@ -190,6 +207,8 @@ class PaymentInitiateView(BaseView):
         }})
 
 
+# step 4 - confirm payment after gateway processes it
+# this creates the payment record, activates subscription and generates invoice
 class PaymentConfirmView(BaseView):
     def post(self, request):
         internal_reference = request.data.get('internal_reference')
@@ -203,22 +222,26 @@ class PaymentConfirmView(BaseView):
         gateway_txn.gateway_signature = gateway_signature
         gateway_txn.status = 'paid'
         gateway_txn.save()
+        # create our internal payment record
         payment = Payment.objects.create(
             user=gateway_txn.user, gateway_transaction=gateway_txn,
             amount=gateway_txn.amount, currency=gateway_txn.currency,
             country=gateway_txn.country, payment_type='card', status='completed',
             description=f"Subscription payment for {gateway_txn.plan.name} plan"
         )
+        # activate subscription - 365 days for yearly, 30 for monthly
         end_date = timezone.now() + timedelta(days=365 if gateway_txn.plan.billing_cycle == 'yearly' else 30)
         subscription = UserSubscription.objects.create(
             user=gateway_txn.user, plan=gateway_txn.plan, payment=payment,
             status='active', country=gateway_txn.country,
             amount_paid=gateway_txn.amount, currency=gateway_txn.currency, end_date=end_date
         )
+        # calculate tax - 18% for india, 10% for australia
         from decimal import Decimal
         tax_rate = Decimal("18.00") if gateway_txn.country == "India" else Decimal("10.00")
         tax_amount = (gateway_txn.amount * tax_rate) / 100
         total = gateway_txn.amount + tax_amount
+        # auto generate invoice
         invoice = Invoice.objects.create(
             user=gateway_txn.user, payment=payment, subscription=subscription,
             subtotal=gateway_txn.amount, tax_rate=tax_rate, tax_amount=tax_amount,
@@ -226,6 +249,7 @@ class PaymentConfirmView(BaseView):
             buyer_email=gateway_txn.user.email,
             buyer_gst=gateway_txn.user.gst_number or '', status='sent'
         )
+        # generate qr code and attach to invoice
         qr_data = f"Invoice:{invoice.invoice_number}|Amount:{total}|User:{gateway_txn.user.email}"
         qr = qrcode.make(qr_data)
         buffer = BytesIO()
@@ -241,6 +265,8 @@ class PaymentConfirmView(BaseView):
         }})
 
 
+# webhook - gateway calls this when payment status changes
+# eg payment.captured, payment.failed, refund.created
 class WebhookView(BaseView):
     def post(self, request):
         event = request.data.get('event', '')
@@ -262,6 +288,7 @@ class WebhookView(BaseView):
         return Response({'success': True, 'message': f'Webhook {event} processed'})
 
 
+# payment list and create
 class PaymentListView(BaseView):
     def get(self, request):
         payments = Payment.objects.all().order_by('-created_at')
@@ -269,6 +296,7 @@ class PaymentListView(BaseView):
 
     def post(self, request):
         payment_type = request.data.get('payment_type')
+        # route to the right serializer based on payment type
         if payment_type == 'card':
             serializer = CardPaymentSerializer(data=request.data)
         elif payment_type == 'cash':
@@ -285,6 +313,7 @@ class PaymentListView(BaseView):
         return Response({'success': True, 'message': f'{count} payments deleted'})
 
 
+# get, update or delete a single payment
 class PaymentDetailView(BaseView):
     def get(self, request, pk):
         payment = self.get_object(Payment, pk)
@@ -310,6 +339,8 @@ class PaymentDetailView(BaseView):
         return Response({'success': True, 'message': f'Payment #{pk} deleted'})
 
 
+# validates gst number format - 15 char alphanumeric
+# eg 27AAPFU0939F1ZV
 def validate_gst_format(gst):
     pattern = r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$'
     return bool(re.match(pattern, gst))
@@ -322,6 +353,7 @@ class GSTValidationView(BaseView):
             return Response({'success': False, 'message': 'GST number required'}, status=status.HTTP_400_BAD_REQUEST)
         if not validate_gst_format(gst_number):
             return Response({'success': False, 'is_valid': False, 'message': 'Invalid GST format'}, status=status.HTTP_400_BAD_REQUEST)
+        # first 2 digits are state code, next 10 are pan number
         state_codes = {'01': 'Jammu & Kashmir', '07': 'Delhi', '09': 'Uttar Pradesh', '19': 'West Bengal', '27': 'Maharashtra', '29': 'Karnataka', '32': 'Kerala', '33': 'Tamil Nadu', '36': 'Telangana'}
         state_code = gst_number[:2]
         pan_number = gst_number[2:12]
@@ -330,6 +362,7 @@ class GSTValidationView(BaseView):
         return Response({'success': True, 'is_valid': True, 'gst_number': gst_number, 'pan_number': pan_number, 'state': state, 'state_code': state_code, 'status': 'Active', 'message': 'GST number is valid'})
 
 
+# invoice list and create
 class InvoiceListView(BaseView):
     def get(self, request):
         invoices = Invoice.objects.all().order_by('-created_at')
@@ -339,6 +372,7 @@ class InvoiceListView(BaseView):
         serializer = InvoiceSerializer(data=request.data)
         if serializer.is_valid():
             invoice = serializer.save()
+            # generate and attach qr code
             qr_data = f"Invoice:{invoice.invoice_number}|Amount:{invoice.total_amount}|User:{invoice.user.name}"
             qr = qrcode.make(qr_data)
             buffer = BytesIO()
@@ -349,6 +383,8 @@ class InvoiceListView(BaseView):
         return Response({'success': False, 'errors': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
 
+# get, edit or delete a single invoice
+# editing creates a revised invoice with RINV- prefix
 class InvoiceDetailView(BaseView):
     def get(self, request, pk):
         invoice = self.get_object(Invoice, pk)
@@ -375,6 +411,8 @@ class InvoiceDetailView(BaseView):
         return Response({'success': True, 'message': 'Invoice permanently deleted'})
 
 
+# verify if an invoice is real or fake by invoice number
+# checks both original and revised invoice numbers
 class InvoiceVerifyView(BaseView):
     def get(self, request, invoice_number):
         try:
@@ -384,6 +422,8 @@ class InvoiceVerifyView(BaseView):
             return Response({'success': False, 'is_genuine': False, 'message': 'Invoice not found'}, status=status.HTTP_404_NOT_FOUND)
 
 
+# eway bill - supports india and australia
+# filter by country using ?country=India
 class EwayBillListView(BaseView):
     def get(self, request):
         country = request.query_params.get('country', None)
@@ -416,6 +456,8 @@ class EwayBillDetailView(BaseView):
         return Response({'success': True, 'message': 'E-way bill cancelled'})
 
 
+# runs daily as cron job in production
+# finds subscriptions expiring in next 7 days and marks them for notification
 class RenewalCheckView(BaseView):
     def get(self, request):
         if not self.superadmin_only(request):
